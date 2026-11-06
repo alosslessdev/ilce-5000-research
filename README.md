@@ -153,6 +153,17 @@ or keys are distributed here; only the procedure and the findings.
 * Legal: reverse engineering for interoperability, on hardware we own. Sony
   firmware remains Sony's property.
 
+## Session archive
+
+The full working session that produced this repository — 720 transcript
+entries, every tool/background-job log untruncated, plus a standalone
+`viewer.html`:
+
+**[session-2026-11-06.zip](https://github.com/alosslessdev/ilce-5000-research/releases/download/session-2026-11-06/ilce-5000-research-session.zip)**
+
+Exported with the omp `export_session_archive` plugin. Camera serial number
+and LAN MAC addresses are redacted; nothing else was altered.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
