@@ -169,7 +169,7 @@ or keys are distributed here; only the procedure and the findings.
 
 ## Session archive
 
-The full working session that produced this repository — 720 transcript
+The full working session that produced this repository — 786 transcript
 entries, every tool/background-job log untruncated, plus a standalone
 `viewer.html`:
 
