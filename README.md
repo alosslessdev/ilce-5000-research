@@ -96,6 +96,20 @@ So while the camera sits on your access point, nothing listens on `:8080`,
 and the `DIRECT-…:ILCE-5000` AP is not up either. Corroborated by a full sweep
 of the LAN (254 hosts, ports 8080/80/1900) plus SSDP.
 
+## Android userland: an app *can* read liveview
+
+The firmware's own framework exposes the preview pipeline to PMCA apps —
+`CameraEx` (preview, JPEG listener) and `CameraSequence` (`startPreviewSequence`,
+`getPreviewSequenceFrames(int) → DeviceMemory[]`, `DeviceBuffer.read(ByteBuffer)`,
+plus `JPEG_COMPRESS_*` options). That is how PMCADemo/PMCA-HDMICam put the
+preview on screen, and it is enough for an app to encode frames and serve them
+over WiFi.
+
+Over USB it changes nothing: an app cannot add a gadget function or answer PTP,
+so the port stays stills-only.
+
+Details, class/method table and a code sketch: [docs/android-api.md](docs/android-api.md).
+
 ## Existing software, tested
 
 | Project | Result on ILCE-5000 |
