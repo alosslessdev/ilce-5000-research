@@ -173,9 +173,7 @@ The full working session that produced this repository — 786 transcript
 entries, every tool/background-job log untruncated, plus a standalone
 `viewer.html`:
 
-**[session/ilce-5000-research-session.zip](session/ilce-5000-research-session.zip)** —
-also mirrored as a release asset:
-[session-2026-11-06](https://github.com/alosslessdev/ilce-5000-research/releases/tag/session-2026-11-06)
+**[session/ilce-5000-research-session.zip](session/ilce-5000-research-session.zip)**
 
 Exported with the omp `export_session_archive` plugin. Camera serial number
 and LAN MAC addresses are redacted; nothing else was altered.
