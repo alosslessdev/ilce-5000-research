@@ -175,8 +175,9 @@ entries, every tool/background-job log untruncated, plus a standalone
 
 **[session/ilce-5000-research-session.zip](session/ilce-5000-research-session.zip)**
 
-Exported with the omp `export_session_archive` plugin. Camera serial number
-and LAN MAC addresses are redacted; nothing else was altered.
+Exported with the omp `export_session_archive` plugin. Camera serial number,
+LAN MAC addresses, local usernames, home paths, host names, filesystem UUIDs
+and the author's email addresses are redacted; nothing else was altered.
 
 ## License
 
