@@ -23,6 +23,7 @@ import usb.core
 import usb.util
 
 VID, PID = 0x054c, 0x094f
+PTP_INTERFACE = (6, 1, 1)   # still-image class / PTP / PIMA 15740
 
 # operation codes
 OC_GET_DEVICE_INFO = 0x1001
@@ -59,6 +60,61 @@ class PtpError(RuntimeError):
         super().__init__(f"{where}: PTP error {code:#06x}")
 
 
+class NoObject(RuntimeError):
+    """No ObjectAdded event: the release produced no downloadable object."""
+
+
+def sony_prop_value(blob, code):
+    """Current value of a u16 Sony property out of the 0x9209 blob.
+
+    Record layout (libgphoto2 `ptp_unpack_Sony_DPD`): prop code u16, datatype
+    u16, get/set u8, is-enabled u8, default value, current value, form flag and
+    form data. `GetDevicePropDesc` (0x1014) stalls on this body, so the whole
+    property set has to be read with `GetAllExtDevicePropInfo` (0x9209), and
+    the current value is the u16 at record offset 8."""
+    want = struct.pack("<HH", code, 0x0004)      # u16 datatype
+    off = blob.find(want)
+    if off < 0:
+        raise KeyError(f"property {code:#06x} not in the SDIO blob")
+    if blob[off + 5] > 2:
+        raise KeyError(f"property {code:#06x}: not a u16 record")
+    return struct.unpack_from("<H", blob, off + 8)[0]
+
+
+def find_camera(vid=VID, pid=None):
+    """Return the Sony device that actually exposes a PTP interface.
+
+    The body re-enumerates as 054c:07c6 (mass storage / MTP) when the USB link
+    is reset or the mode setting changes, so matching on the PC-Remote PID
+    alone reports "not found" for a camera that is plainly plugged in."""
+    others = []
+    fallback = None
+    for dev in usb.core.find(find_all=True, idVendor=vid):
+        try:
+            intfs = list(dev.get_active_configuration())
+        except usb.core.USBError:
+            continue
+        if not intfs:
+            continue
+        kinds = {(i.bInterfaceClass, i.bInterfaceSubClass, i.bInterfaceProtocol)
+                 for i in intfs}
+        if PTP_INTERFACE not in kinds:
+            others.append(dev)
+        elif not pid or dev.idProduct == pid:
+            return dev
+        elif fallback is None:
+            fallback = dev          # PTP under a different PID
+    if fallback is not None:
+        return fallback
+    if others:
+        seen = ", ".join(f"{d.idProduct:04x}" for d in others)
+        raise SystemExit(
+            f"camera is not in PC Remote mode (054c:{seen} offers no PTP "
+            f"interface). Replug it and set USB Connection -> PC Remote")
+    raise SystemExit(f"no Sony camera on USB ({vid:04x}:*); set USB "
+                     f"Connection -> PC Remote")
+
+
 def response_name(code):
     return {
         0x2001: "OK", 0x2002: "GeneralError", 0x2005: "OperationNotSupported",
@@ -69,12 +125,17 @@ def response_name(code):
 
 class PtpUsb:
     def __init__(self, vid=VID, pid=PID, reset=False):
-        self.dev = usb.core.find(idVendor=vid, idProduct=pid)
-        if self.dev is None:
-            raise SystemExit(f"camera {vid:04x}:{pid:04x} not found "
-                             "(set USB Connection to PC Remote)")
+        self.vid, self.pid = vid, pid
+        self.dev = find_camera(vid, pid)
         if reset:
             self._usb_reset(vid, pid)
+        self._bind()
+        self.tid = 0
+        self.session_open = False
+
+    def _bind(self):
+        """Claim the PTP interface and cache its endpoints. Re-run after a USB
+        reset, since the kernel hands out a fresh device handle."""
         self.dev.set_configuration()
         cfg = self.dev.get_active_configuration()
         self.intf = cfg[(0, 0)]
@@ -90,13 +151,27 @@ class PtpUsb:
                 self.dev.clear_halt(addr)
             except usb.core.USBError:
                 pass
-        self.tid = 0
-        self.session_open = False
 
-    def _usb_reset(self, vid, pid, timeout=10.0):
-        """Re-enumerate the camera. A single aborted PTP data phase otherwise
-        wedges the device until the cable is pulled; reset() is the software
-        equivalent and ~2 s."""
+    def reconnect(self, hard=False):
+        """Drop the session and re-attach. Soft recovery clears the endpoint
+        halts and rebuilds the Sony session; object handles from before are
+        gone either way. `hard` additionally resets the USB link, which on
+        this body can re-enumerate it as 054c:07c6 (mass storage/MTP) - use it
+        only when the soft path keeps failing."""
+        self.close()
+        if hard:
+            self._usb_reset(self.vid, self.pid)
+        self._bind()
+        self.tid = 0
+        self.open()
+        self.wake()
+        self.sony_connect(verbose=False)
+
+    def _usb_reset(self, vid, pid, timeout=15.0):
+        """Reset the USB link and re-bind. Not a free operation on this body:
+        the camera re-enumerates as 054c:07c6 (mass storage/MTP) and stays
+        there until it is replugged or switched back to PC Remote, so callers
+        only reach this through --hard-reset."""
         try:
             self.dev.reset()
         except usb.core.USBError:
@@ -107,17 +182,21 @@ class PtpUsb:
             pass
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            time.sleep(0.4)
-            dev = usb.core.find(idVendor=vid, idProduct=pid)
-            if dev is None:
+            time.sleep(0.5)
+            try:
+                dev = find_camera(vid, pid)   # raises until PTP is back
+            except SystemExit:
                 continue
             try:
                 dev.set_configuration()
             except usb.core.USBError:
                 continue
             self.dev = dev
+            time.sleep(1.0)          # let PTP init finish before the first op
             return
-        raise SystemExit("camera did not re-enumerate after a USB reset")
+        raise SystemExit("camera did not re-enumerate as a PTP device after a "
+                         "USB reset; replug it and set USB Connection -> PC "
+                         "Remote")
 
     def _ep(self, addr):
         return usb.util.find_descriptor(
@@ -211,9 +290,17 @@ class PtpUsb:
         for phase in (1, 2):
             self.cmd(OC_SDIO_CONNECT, (phase, 0, 0), timeout=8000)
         info = None
-        for attempt in range(20):
-            rcode, data = self.transact(OC_SDIO_GET_EXT_DEVICE_INFO,
-                                        (SONY_PROTOCOL_3_00, 1), timeout=8000)
+        for attempt in range(8):
+            try:
+                rcode, data = self.transact(OC_SDIO_GET_EXT_DEVICE_INFO,
+                                            (SONY_PROTOCOL_3_00, 1), timeout=8000)
+            except usb.core.USBError as e:
+                # The first 0x9202 after a session change regularly times out;
+                # it succeeds on the next pass once the camera has re-armed.
+                if verbose:
+                    print(f"[usb] GetExtDeviceInfo: {e}", file=sys.stderr)
+                time.sleep(0.3 * (attempt + 1))
+                continue
             if rcode == 0x2001 and data:
                 info = data
                 break
@@ -242,6 +329,12 @@ class PtpUsb:
             raise PtpError(rcode, "GetAllExtDevicePropInfo")
         return data
 
+    def object_in_memory(self):
+        """0xD215: 0 = no RAM object, 1 = RAM object still being written,
+        >= 0x8000 = the object is complete and readable. Downloading at 1
+        makes this firmware abort the data phase."""
+        return sony_prop_value(self.all_props(), DPC_OBJECT_IN_MEMORY)
+
     # -- objects ---------------------------------------------------------- #
     def object_handles(self, storage=0xFFFFFFFF, fmt=0, parent=0xFFFFFFFF):
         rcode, data = self.cmd(OC_GET_OBJECT_HANDLES, (storage, fmt, parent))
@@ -250,18 +343,40 @@ class PtpUsb:
 
     def object_info(self, handle):
         rcode, data = self.cmd(OC_GET_OBJECT_INFO, (handle,))
+        if len(data) < 12:
+            # The camera answers OK with an empty data phase while the RAM
+            # object is not registered yet; callers retry on NoSuchObject.
+            raise PtpError(0x2009, f"GetObjectInfo({handle:#x})")
         return parse_object_info(data)
 
-    def get_object(self, handle, size=None, chunk=64 * 1024, timeout=60000):
+    def get_object(self, handle, size=None, chunk=64 * 1024, timeout=5000,
+                   retries=3):
         """Download an object with GetPartialObject (the a5000 stalls GetObject
-        for RAM handles)."""
+        for RAM handles).
+
+        A chunk can still abort with Errno 5 while the camera finishes the
+        file; the endpoint keeps the stall, so clear it and re-issue the same
+        offset with a growing delay instead of restarting the shot."""
         if size is None:
             size = self.object_info(handle)["size"]
         out = bytearray()
         while len(out) < size:
             want = min(chunk, size - len(out))
-            rcode, data = self.transact(OC_GET_PARTIAL_OBJECT,
-                                        (handle, len(out), want), timeout=timeout)
+            for attempt in range(retries + 1):
+                try:
+                    rcode, data = self.transact(
+                        OC_GET_PARTIAL_OBJECT, (handle, len(out), want),
+                        timeout=timeout)
+                except usb.core.USBError:
+                    if attempt >= retries:
+                        raise
+                    try:
+                        self.dev.clear_halt(0x81)
+                    except usb.core.USBError:
+                        pass
+                    time.sleep((0.3, 1.0, 3.0)[attempt])
+                    continue
+                break
             if rcode not in (0x2001, 0x201D) or not data:
                 raise PtpError(rcode, "GetPartialObject")
             out += data
@@ -351,13 +466,36 @@ def cmd_info(ptp, args):
 
 
 def shoot(ptp, out_path, args):
-    """One release: half press (optional), full press, wait, download."""
+    """One released shot, retried if the transfer aborts or no object appears.
+
+    The retry releases the shutter again: an aborted download means the file
+    may exist on the card but not on the host. The reset has to happen per
+    shot, not around the whole command, or a `--count` run restarts at shot 1
+    and overwrites the files it already wrote."""
+    for attempt in range(1, args.attempts + 1):
+        try:
+            return _shoot_once(ptp, out_path, args)
+        except (usb.core.USBError, NoObject) as e:
+            if attempt >= args.attempts:
+                raise
+            print(f"[usb] {e}; reconnecting and re-releasing "
+                  f"({attempt}/{args.attempts - 1})", file=sys.stderr)
+            ptp.reconnect(hard=args.hard_reset)
+
+
+def _shoot_once(ptp, out_path, args):
+    """One release: half press (optional), full press, wait for the RAM object,
+    then download it in 64 KiB GetPartialObject chunks."""
     t0 = time.monotonic()
     if args.focus:
         ptp.set_prop(DPC_SHUTTER_HALF_RELEASE, 2, control=True)
         time.sleep(args.half_press_wait)
     ptp.set_prop(DPC_SHUTTER_RELEASE, 2, control=True)
 
+    # ObjectAdded is the only readiness signal this body offers before the
+    # object can be read. Polling 0x9209 (0xd215) while the JPEG is written is
+    # what makes the firmware abort the transfer and drop the link, so the
+    # capture path never touches it; object_in_memory() is for diagnostics.
     handle = None
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
@@ -373,22 +511,25 @@ def shoot(ptp, out_path, args):
     t_release = time.monotonic()
 
     if handle is None:
-        handle = RAM_OBJECT_HANDLE
-        print("[usb] no ObjectAdded event, trying RAM object 0xffffc001",
-              file=sys.stderr)
+        raise NoObject(f"no ObjectAdded within {args.timeout:.0f}s")
 
+    # The handle is announced before the object is readable, and a read that
+    # arrives too early aborts the bulk-IN data phase (Errno 5).
+    time.sleep(args.settle)
     info = None
-    for _ in range(int(args.timeout * 2)):
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
         try:
             info = ptp.object_info(handle)
-            if info["size"]:
-                break
         except PtpError as e:
             if e.code not in (0x2009, 0x2019, 0x2002):
                 raise
+            info = None
+        if info and info["size"]:
+            break
         time.sleep(0.5)
-    if not info:
-        raise SystemExit("no object became available")
+    if not info or not info["size"]:
+        raise NoObject("object published but never became readable")
 
     data = ptp.get_object(handle, size=info["size"])
     with open(out_path, "wb") as f:
@@ -401,15 +542,13 @@ def shoot(ptp, out_path, args):
 
 
 def cmd_capture(ptp, args):
-    """Each shot gets a fresh PTP session: a second release in the same session
-    usually loses the ObjectAdded event and has to fall back to a slow poll."""
+    """One PTP session for the whole burst. Closing and re-opening per shot
+    wedges the SDIO layer on this body (GetExtDeviceInfo starts timing out and
+    the property dump comes back empty); if a release in the same session
+    loses its ObjectAdded event, shoot() reconnects and retries."""
     cam = ptp
+    cam.sony_connect(verbose=False)
     for n in range(args.count):
-        if n:
-            cam.close()
-            cam = PtpUsb(args.vid, args.pid)
-            cam.open()
-        cam.sony_connect()
         if args.count > 1:
             base, ext = os.path.splitext(args.out or "shot.JPG")
             out = f"{base}_{n + 1:02d}{ext or '.JPG'}"
@@ -418,8 +557,7 @@ def cmd_capture(ptp, args):
         shoot(cam, out, args)
         if n + 1 < args.count:
             time.sleep(args.interval)
-    if cam is not ptp:
-        cam.close()
+    return cam
 
 
 def cmd_prop(ptp, args):
@@ -434,9 +572,10 @@ def main(argv=None):
     p = argparse.ArgumentParser(description="ILCE-5000 USB still capture (PTP)")
     p.add_argument("--vid", type=lambda x: int(x, 0), default=VID)
     p.add_argument("--pid", type=lambda x: int(x, 0), default=PID)
-    p.add_argument("--no-reset", action="store_true",
-                   help="skip the USB reset at startup (faster, but a stale "
-                        "PTP state will make the run fail)")
+    p.add_argument("--hard-reset", action="store_true",
+                   help="reset the USB link before running; this body then "
+                        "re-enumerates as 054c:07c6 (mass storage/MTP) and "
+                        "needs a replug before it speaks PTP again")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("info")
@@ -449,44 +588,45 @@ def main(argv=None):
     sp.add_argument("--interval", type=float, default=2.0)
     sp.add_argument("--focus", action="store_true", help="half press first")
     sp.add_argument("--half-press-wait", type=float, default=0.8)
+    sp.add_argument("--attempts", type=int, default=2,
+                    help="tries per shot before giving up; a retry releases "
+                         "the shutter again")
+    sp.add_argument("--settle", type=float, default=1.5,
+                    help="seconds to wait after ObjectAdded before reading; "
+                         "this body aborts the data phase if the RAM object is "
+                         "still being flushed")
     sp.set_defaults(func=cmd_capture)
 
     sp = sub.add_parser("prop")
     sp.set_defaults(func=cmd_prop)
 
     args = p.parse_args(argv)
-    ptp = PtpUsb(args.vid, args.pid, reset=not args.no_reset)
-    ptp.open()
-    if not ptp.wake():
-        print("[usb] no answer, resetting USB ...", file=sys.stderr)
-        try:
-            ptp.dev.reset()
-        except usb.core.USBError:
-            pass
-        time.sleep(2.0)
-        ptp = PtpUsb(args.vid, args.pid)
-        ptp.open()
-        ptp.wake()
+    ptp = PtpUsb(args.vid, args.pid, reset=args.hard_reset)
     try:
-        try:
-            args.func(ptp, args)
-        except PtpError as e:
-            print(f"error: {e}", file=sys.stderr)
-            return 2
-        except usb.core.USBError:
-            # The camera occasionally stops answering after an aborted
-            # transaction. A USB reset re-enumerates it and normal service
-            # resumes; retry the command once.
-            print("[usb] camera stopped answering, resetting USB ...",
-                  file=sys.stderr)
-            try:
-                ptp.dev.reset()
-            except usb.core.USBError:
-                pass
-            time.sleep(2.0)
-            ptp = PtpUsb(args.vid, args.pid, reset=True)
-            ptp.open()
-            args.func(ptp, args)
+        ptp.open()
+    except usb.core.USBError as e:
+        raise SystemExit(f"camera went away before OpenSession ({e}); replug "
+                         f"it and set USB Connection -> PC Remote")
+    if not ptp.wake():
+        # Soft recovery only: a USB reset drops this body into its mass-storage
+        # personality and costs a physical replug.
+        print("[usb] no answer; rebuilding the PTP session", file=sys.stderr)
+        ptp.reconnect(hard=args.hard_reset)
+        if not ptp.wake():
+            raise SystemExit("camera stopped answering; replug it and set USB "
+                             "Connection -> PC Remote")
+    try:
+        args.func(ptp, args)
+    except NoObject as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 3
+    except PtpError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except usb.core.USBError as e:
+        print(f"error: camera stopped answering ({e}); rerun, and replug the "
+              f"camera if it keeps failing", file=sys.stderr)
+        return 2
     finally:
         ptp.close()
     return 0

@@ -128,6 +128,40 @@ service dhcpcd_ath0 /system/bin/wlan_tool dhcpcd ath0
   owner simultaneously, which is why the API is unreachable while the camera
   is joined to an access point.
 
+### The PTP data path (where the transfers die)
+
+`lib/libptp.so` is the camera-side PTP implementation and exports the object
+manager the RAM buffer goes through:
+
+```
+ptpw_objmgr_GetPartialObject      ptpw_dat_GetPartialObject
+ptpw_objmgr_GetObject             ptpw_objmgr_GetObjectSize
+ptpw_objmgr_TerminateGetPartialObject
+ptpw_cmd_GetPartialObject         ptpw_res_GetPartialObject
+```
+
+Disassemble with `llvm-objdump -d --triple=thumbv7-linux-gnueabihf` — the
+code is Thumb-2 and plain `objdump` on x86 reports `architecture: UNKNOWN`.
+
+`kmod/usbg_stillimage.ko` ("USB Still Image Class function driver") is the
+gadget half and carries the error path that shows up on the wire as a stalled
+bulk-IN endpoint (`Errno 5`):
+
+```
+sicd_bulk_in_halt        sicd_bulk_in_halt_clear
+sicd_bulk_out_halt       sicd_bulk_out_halt_clear
+sicd_ep_dequeue_bulk     sicd_is_valid_buffer
+```
+
+So the abort is the gadget halting its own IN endpoint; the host has to
+`CLEAR_FEATURE(ENDPOINT_HALT)` before the next transfer — which is exactly what
+the capture tool does between chunk retries.
+
+There is no completion flag in the property set. `0xd215` is the only
+candidate, and on this body it reaches `0x8001` roughly 2 s before the object
+answers reads, so it cannot gate the download; a short settle after
+`ObjectAdded` is the only lever that works.
+
 ### App gating (movie recording only)
 
 `SmartRemote.apk` (system app, `nflasha16/app/`) resolves `isMovieRecSupported()`

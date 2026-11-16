@@ -46,19 +46,38 @@ OpenSession
 SDIO_Connect 1 → 2 → (SDIO_GetExtDeviceInfo) → 3
 SDIO_ControlDevice 0xd2c1 (half press) / 0xd2c2 (full press), 2 = press, 1 = release
 wait for event 0xc201 ObjectAdded  → handle 0xffffc001 (RAM buffer)
+poll GetObjectInfo (0x1008) until it returns a size, then settle ~1.5 s
 GetPartialObject 0x101b in 64 KiB chunks
 ```
 
 Quirks that make or break it on this body:
 
-* `GetObject` (0x1009) is **stalled** for RAM handles — use `GetPartialObject`.
+* `GetObject` (0x1009) is **stalled** for RAM handles even when `0xd215`
+  reports `0x8001` — use `GetPartialObject`.
 * 512 KiB chunks overflow the camera; 64 KiB is stable.
-* A second release **in the same PTP session** loses the `ObjectAdded` event.
-  One session per shot.
-* One aborted data phase wedges the device until the cable is pulled; a
-  `usb.reset()` (~1.8 s) is the software equivalent.
+* The handle is announced **before** the object is readable. `GetObjectInfo`
+  answers `OK` with an empty data phase until the object is registered, and a
+  `GetPartialObject` issued too early aborts the bulk-IN data phase
+  (`Errno 5`); the firmware then drops off the bus and re-enumerates as
+  `054c:07c6` (mass storage/MTP). Poll for a size, then wait ~1.5 s.
+* `0xd215` is not a usable completion signal here: it reads `0` → `1` → `0x8001`
+  and is already `0x8001` when `ObjectAdded` fires, roughly 2 s before the
+  object starts answering reads. Reading it means a `0x9209` dump, and issuing
+  those during or right after a capture correlates with the camera vanishing
+  from the bus — the capture path never does.
+* One PTP session per **burst**, not per shot: closing and re-opening between
+  shots wedges the SDIO layer (`GetExtDeviceInfo` times out, the 0x9209 dump
+  comes back empty) and only a replug clears it. A release inside an open
+  session occasionally loses its `ObjectAdded` event; the tool then reconnects
+  and re-releases instead of downloading a stale RAM object.
+* `usb.reset()` is **not** a recovery path on this body: the camera
+  re-enumerates as `054c:07c6` (mass storage/MTP), and only a replug or a
+  trip through *USB Connection → PC Remote* brings PTP back. `--hard-reset`
+  opts into it; the default recovery is CloseSession + re-claim + fresh
+  session.
 * `GetDevicePropDesc` (0x1014) stalls and `SetDevicePropValue` (0x1016) is not
-  advertised, so settings cannot be read or changed over this interface.
+  advertised, so settings cannot be read or changed over this interface;
+  everything comes out of the 0x9209 dump instead.
 
 ## WiFi — what the API gives you
 
@@ -119,9 +138,12 @@ Details, class/method table and a code sketch: [docs/android-api.md](docs/androi
 | Sony Camera Remote SDK / Command | current models only |
 | Sony-PMCA-RE / PMCA-RE RELOADED | apps/settings/firmware, not capture |
 
-libgphoto2's Sony capture sequence is the same one reimplemented here; the
-parts that differ are the ones that fail on this camera (property reads,
-`GetObject`, one long-lived session).
+libgphoto2's Sony capture sequence is the same one reimplemented here — its
+`camera_sony_capture` also waits for `0xd215 >= 0x8000` and drains a stale
+`0x8001` RAM object first. What differs on this body is the transport: `0x1014`
+stalls (properties come from `0x9209`), `GetObject` stalls (64 KiB
+`GetPartialObject` chunks), and a USB reset costs the camera's PTP
+personality.
 
 ## Tools
 
@@ -140,7 +162,16 @@ python3 -m pip install pyusb
 python3 tools/sony_usb.py info
 python3 tools/sony_usb.py capture --out shot.jpg --focus
 python3 tools/sony_usb.py capture --out shot.jpg --count 5 --interval 2
+python3 tools/sony_usb.py capture --out shot.jpg --attempts 3
 ```
+
+Each shot is one PTP session. `--settle N` is the pause between the announced
+object and the first read — too short and the camera aborts the transfer and
+drops off the bus. `--attempts N` reconnects (CloseSession + fresh session) and
+releases the shutter again if no object appears or the transfer aborts.
+`--hard-reset` adds a USB reset to that recovery, which drops the camera into
+mass-storage/MTP until it is replugged — it exists for when a soft re-attach
+cannot clear a wedged endpoint, not as a default.
 
 USB node permissions:
 

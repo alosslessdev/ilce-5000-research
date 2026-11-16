@@ -30,7 +30,7 @@ DevicePropChanged`.
 | `0xd2c1` | ShutterHalfRelease | u16, `2` press / `1` release |
 | `0xd2c2` | ShutterRelease | u16, `2` press / `1` release |
 | `0xd213` | FocusFound | u8, `2`/`3` = focused |
-| `0xd215` | ObjectInMemory | u16, `>= 0x8000` = RAM object ready |
+| `0xd215` | ObjectInMemory | u16, `0` → `1` (writing) → `0x8001`; see caveat below |
 
 `0x9202` must be sent with parameters `(0x012c, 1)`; the camera answers with its
 actual protocol version (`0x00c8` = 2.0 on this body) and a list of vendor
@@ -49,17 +49,28 @@ SDIO_ControlDevice(0xd2c1, u16 2)      # half press (optional)
 SDIO_ControlDevice(0xd2c2, u16 2)      # full press
 wait event 0xc201 → handle 0xffffc001
 SDIO_ControlDevice(0xd2c2, u16 1); SDIO_ControlDevice(0xd2c1, u16 1)
-GetObjectInfo(handle) → compressed size
+GetObjectInfo(handle) → may answer OK with no data; poll until a size appears
+settle ~1.5 s                       # the object is announced before it is readable
 GetPartialObject(handle, offset, 65536) ... until size
 ```
 
 Failure modes on this model:
 
 * `GetObjectHandles` (0x1007) and `GetDevicePropDesc` (0x1014) stall the
-  endpoint — touching either leaves the camera unresponsive until a USB reset;
-* `GetObject` (0x1009) stalls for RAM handles;
+  endpoint; a USB reset is **not** the way out — it re-enumerates the camera as
+  `054c:07c6` (mass storage/MTP) and only a replug restores PC Remote;
+* `GetObject` (0x1009) stalls for RAM handles, even when `0xd215` says
+  `0x8001`;
 * requesting 512 KiB per partial object overflows the camera;
-* a second release in one session misses `0xc201` (20 s fallback).
+* `0xd215` reaches `0x8001` about 2 s before the object answers reads; issuing
+  a read then aborts the bulk-IN data phase (`Errno 5`) and can drop the
+  camera off the bus. It also has to be read through `0x9209`, which the
+  capture path avoids for that reason — timing is the only usable gate;
+* a second release in one session can miss `0xc201`; recover by reconnecting
+  rather than falling back to the RAM handle, which still holds the previous
+  image;
+* closing and re-opening the PTP session between shots wedges the SDIO layer
+  (`GetExtDeviceInfo` stops answering) until the camera is replugged.
 
 PTP container: `u32 length, u16 type (1 command / 2 data / 3 response / 4
 event), u16 code, u32 transaction id`, then parameters (command/event) or
