@@ -32,17 +32,19 @@ DevicePropChanged`.
 | `0xd213` | FocusFound | u8, `2`/`3` = focused |
 | `0xd215` | ObjectInMemory | u16, `0` → `1` (writing) → `0x8001`; see caveat below |
 
-`0x9202` must be sent with parameters `(0x012c, 1)`; the camera answers with its
-actual protocol version (`0x00c8` = 2.0 on this body) and a list of vendor
-codes. Phases `1`, `2`, `3` of `0x9201` correspond to setup, query, and
-"apply".
+`0x9202` must be sent **once** per connect, with parameters `(0x012c, 1)`
+(Remote Camera Control sends `(0x00c8)`) and the camera answers with its actual
+protocol version (`0x00c8` = 2.0 on this body) and a list of vendor codes. The
+first handshake after a power cycle returns the list; later handshakes return
+an empty `OK`, and a repeated request hangs the link. Phases `1`, `2`, `3` of
+`0x9201` correspond to setup, query, and "apply".
 
 ### Capture sequence
 
 ```
 OpenSession(1)
 SDIO_Connect(1,0,0); SDIO_Connect(2,0,0)
-SDIO_GetExtDeviceInfo(0x12c,1)
+SDIO_GetExtDeviceInfo(0x12c,1)        # once
 SDIO_Connect(3,0,0)
 SDIO_SetExtDevicePropValue(0xd25a, u8 1)
 SDIO_ControlDevice(0xd2c1, u16 2)      # half press (optional)
@@ -50,7 +52,7 @@ SDIO_ControlDevice(0xd2c2, u16 2)      # full press
 wait event 0xc201 → handle 0xffffc001
 SDIO_ControlDevice(0xd2c2, u16 1); SDIO_ControlDevice(0xd2c1, u16 1)
 GetObjectInfo(handle) → may answer OK with no data; poll until a size appears
-settle ~1.5 s                       # the object is announced before it is readable
+wait for 0xc203 events to stop (2 s silence) + 1.5 s   # save finished
 GetPartialObject(handle, offset, 65536) ... until size
 ```
 
@@ -62,10 +64,12 @@ Failure modes on this model:
 * `GetObject` (0x1009) stalls for RAM handles, even when `0xd215` says
   `0x8001`;
 * requesting 512 KiB per partial object overflows the camera;
-* `0xd215` reaches `0x8001` about 2 s before the object answers reads; issuing
-  a read then aborts the bulk-IN data phase (`Errno 5`) and can drop the
-  camera off the bus. It also has to be read through `0x9209`, which the
-  capture path avoids for that reason — timing is the only usable gate;
+* `0xd215` reaches `0x8001` about 2 s before the object answers reads, so it is
+  not a completion signal; it also has to be read through `0x9209`, which the
+  capture path avoids. The usable gate is **event quiescence**: `0xc203`
+  property-change events track the save, and reading after 2 s of silence is
+  reliable (64 KiB at ~10 MB/s). Reading during the save aborts the bulk-IN
+  data phase (`Errno 5`) and can drop the camera off the bus;
 * a second release in one session can miss `0xc201`; recover by reconnecting
   rather than falling back to the RAM handle, which still holds the previous
   image;

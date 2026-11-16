@@ -286,30 +286,26 @@ class PtpUsb:
 
     # -- Sony session ----------------------------------------------------- #
     def sony_connect(self, verbose=True):
-        """SDIO_Connect 1 -> 2, then GetExtDeviceInfo, then phase 3."""
+        """SDIO_Connect 1 -> 2, GetExtDeviceInfo, then phase 3.
+
+        GetExtDeviceInfo is sent exactly once. The camera answers the first
+        handshake after a power cycle with the vendor-code list and every
+        later handshake with an empty OK; a second request hangs the link
+        until the camera is power cycled (Remote Camera Control sends it once
+        too)."""
         for phase in (1, 2):
             self.cmd(OC_SDIO_CONNECT, (phase, 0, 0), timeout=8000)
         info = None
-        for attempt in range(8):
-            try:
-                rcode, data = self.transact(OC_SDIO_GET_EXT_DEVICE_INFO,
-                                            (SONY_PROTOCOL_3_00, 1), timeout=8000)
-            except usb.core.USBError as e:
-                # The first 0x9202 after a session change regularly times out;
-                # it succeeds on the next pass once the camera has re-armed.
-                if verbose:
-                    print(f"[usb] GetExtDeviceInfo: {e}", file=sys.stderr)
-                time.sleep(0.3 * (attempt + 1))
-                continue
-            if rcode == 0x2001 and data:
-                info = data
-                break
-            if rcode not in (0x2001, 0xA101, 0x2019):
-                if verbose:
-                    print(f"[usb] GetExtDeviceInfo -> {response_name(rcode)}",
-                          file=sys.stderr)
-                break
-            time.sleep(0.2 * (attempt + 1))
+        rcode, data = self.transact(OC_SDIO_GET_EXT_DEVICE_INFO,
+                                    (SONY_PROTOCOL_3_00, 1), timeout=8000)
+        if rcode == 0x2001:
+            info = data or None
+        elif rcode == 0xA101 and verbose:
+            print("[usb] GetExtDeviceInfo: authentication failed; continuing",
+                  file=sys.stderr)
+        elif rcode != 0x2001 and verbose:
+            print(f"[usb] GetExtDeviceInfo -> {response_name(rcode)}",
+                  file=sys.stderr)
         self.cmd(OC_SDIO_CONNECT, (3, 0, 0), timeout=8000)
         # PriorityMode = 1 (application) - lets the camera accept control
         try:
@@ -483,6 +479,25 @@ def shoot(ptp, out_path, args):
             ptp.reconnect(hard=args.hard_reset)
 
 
+def wait_quiet(ptp, quiet=2.0, max_wait=15.0, verbose=False):
+    """Wait until the camera stops emitting property-change events.
+
+    ObjectAdded fires while the JPEG is still being saved; the 0xc203 events
+    that follow track that save. Reading the RAM object in that window makes
+    the camera serve a short data phase, which stalls bulk-IN and leaves its
+    file handle open (only a power cycle clears it). Once the event stream is
+    quiet the file is complete and 64 KiB reads run at full speed.
+    """
+    start = last = time.monotonic()
+    while time.monotonic() - start < max_wait and time.monotonic() - last < quiet:
+        if ptp.poll_event(200):
+            last = time.monotonic()
+    quiet_for = time.monotonic() - last
+    if verbose:
+        print(f"[usb] save events quiet for {quiet_for:.1f}s", file=sys.stderr)
+    return quiet_for
+
+
 def _shoot_once(ptp, out_path, args):
     """One release: half press (optional), full press, wait for the RAM object,
     then download it in 64 KiB GetPartialObject chunks."""
@@ -514,7 +529,10 @@ def _shoot_once(ptp, out_path, args):
         raise NoObject(f"no ObjectAdded within {args.timeout:.0f}s")
 
     # The handle is announced before the object is readable, and a read that
-    # arrives too early aborts the bulk-IN data phase (Errno 5).
+    # arrives too early aborts the bulk-IN data phase (Errno 5). The camera
+    # reports the end of the save as the point where 0xc203 events stop.
+    if args.quiet_time:
+        wait_quiet(ptp, args.quiet_time, verbose=args.verbose)
     time.sleep(args.settle)
     info = None
     deadline = time.monotonic() + args.timeout
@@ -591,10 +609,13 @@ def main(argv=None):
     sp.add_argument("--attempts", type=int, default=2,
                     help="tries per shot before giving up; a retry releases "
                          "the shutter again")
+    sp.add_argument("--quiet-time", type=float, default=2.0,
+                    help="wait for this many seconds of 0xc203 event silence "
+                         "before reading (the camera is still saving until "
+                         "then); 0 disables the wait")
     sp.add_argument("--settle", type=float, default=1.5,
-                    help="seconds to wait after ObjectAdded before reading; "
-                         "this body aborts the data phase if the RAM object is "
-                         "still being flushed")
+                    help="extra seconds to wait after the save events stop")
+    sp.add_argument("--verbose", action="store_true")
     sp.set_defaults(func=cmd_capture)
 
     sp = sub.add_parser("prop")

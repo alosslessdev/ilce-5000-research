@@ -3,14 +3,16 @@
 What this camera can and cannot do for stills and video over USB/WiFi, with the
 firmware evidence behind each answer, plus working tools.
 
-Tested against a real ILCE-5000 (USB `054c:094f`, firmware 1.10) on Linux.
+Tested against a real ILCE-5000 (USB `054c:094f`, system firmware 1.00; the
+camera reports `DeviceVersion "1.0"` and its JPEGs carry `ILCE-5000 v1.00`).
+1.10 is the latest official update.
 
 ## Results
 
 | Capability | Verdict | Basis |
 |---|---|---|
 | **USB video** (UVC / webcam / PC-Remote liveview) | **No** | single PTP interface, no UVC descriptors, no video-class code in firmware |
-| **USB stills** (shutter release + download) | **Yes** | verified on hardware, 5456×3632 JPEG, ~7.4 MB, ~2 s/shot |
+| **USB stills** (shutter release + download) | **Yes** | verified on hardware, 5456×3632 JPEG (~6 MB), ~7 s/shot incl. wait for the save; a stalled attempt retakes |
 | **WiFi liveview + stills** | **Yes, preview quality** | Camera Remote API served by the Smart Remote Control app (Wi-Fi Direct) |
 | **WiFi remote control over an existing access point** | **No** | remote path is Wi-Fi Direct only; the radio cannot be station and group owner at once |
 | **Real video at all** | **HDMI + capture card** | non-clean by default; clean 1080p is reachable via a settings-memory write |
@@ -43,12 +45,15 @@ The a5000's object layer also lacks the liveview command set its sibling has:
 
 ```
 OpenSession
-SDIO_Connect 1 → 2 → (SDIO_GetExtDeviceInfo) → 3
+SDIO_Connect 1 → 2 → SDIO_GetExtDeviceInfo(0x012c, 1) → 3    (ext info exactly once)
 SDIO_ControlDevice 0xd2c1 (half press) / 0xd2c2 (full press), 2 = press, 1 = release
 wait for event 0xc201 ObjectAdded  → handle 0xffffc001 (RAM buffer)
-poll GetObjectInfo (0x1008) until it returns a size, then settle ~1.5 s
+wait for the 0xc203 save events to stop (2 s of silence) + 1.5 s margin
 GetPartialObject 0x101b in 64 KiB chunks
 ```
+
+The same sequence is what Remote Camera Control 3.8 sends; see
+[docs/rcc.md](docs/rcc.md) for the disassembly evidence.
 
 Quirks that make or break it on this body:
 
@@ -59,7 +64,18 @@ Quirks that make or break it on this body:
   answers `OK` with an empty data phase until the object is registered, and a
   `GetPartialObject` issued too early aborts the bulk-IN data phase
   (`Errno 5`); the firmware then drops off the bus and re-enumerates as
-  `054c:07c6` (mass storage/MTP). Poll for a size, then wait ~1.5 s.
+  `054c:07c6` (mass storage/MTP).
+* **The save end is visible as event silence.** `ObjectAdded` fires while the
+  JPEG is still being written, and the camera keeps emitting `0xc203`
+  property-change events until it is done. Reading in that window is what
+  aborts the transfer; once the events stop, 64 KiB reads run at ~10 MB/s
+  (6 MB in 0.6 s). The tool waits for 2 s of silence (`--quiet-time`) plus a
+  1.5 s margin (`--settle`).
+* **`SDIO_GetExtDeviceInfo` (0x9202) must be sent once per connect.** The
+  first handshake after a power cycle returns the vendor-code list (protocol
+  `0x00c8` = 2.0); every later handshake returns an empty `OK`. Repeating the
+  request hangs the PTP link until the camera is power cycled — this is why
+  the tool no longer retries it.
 * `0xd215` is not a usable completion signal here: it reads `0` → `1` → `0x8001`
   and is already `0x8001` when `ObjectAdded` fires, roughly 2 s before the
   object starts answering reads. Reading it means a `0x9209` dump, and issuing
@@ -134,6 +150,7 @@ Details, class/method table and a code sketch: [docs/android-api.md](docs/androi
 | Project | Result on ILCE-5000 |
 |---|---|
 | libgphoto2 2.5.34 (`gphoto2`) | detects the body, `capture()` fails after ~36 s |
+| Remote Camera Control 3.8 (Sony) | protocol recovered by disassembly; see [docs/rcc.md](docs/rcc.md) |
 | pysonycam (olkham) | rejects auth: wants SDIO protocol 3.0 (`0x12c`), camera reports `0xc8` |
 | Sony Camera Remote SDK / Command | current models only |
 | Sony-PMCA-RE / PMCA-RE RELOADED | apps/settings/firmware, not capture |
