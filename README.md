@@ -229,10 +229,17 @@ The follow-up session that made the USB capture reliable on hardware — the
 
 **[session/ilce-5000-usb-capture-session.zip](session/ilce-5000-usb-capture-session.zip)**
 
-Both exported with the omp `export_session_archive` plugin. Camera serial
+The third session reverse engineered Sony's Remote Camera Control 3.8 and
+turned the results into the final protocol fixes (single `0x9202`, save-event
+quiescence, 64 KiB reads), with the installer/MSI/CAB extraction and Ghidra
+decompilation trail (772 entries):
+
+**[session/ilce-5000-rcc-protocol-session.zip](session/ilce-5000-rcc-protocol-session.zip)**
+
+All exported with the omp `export_session_archive` plugin. Camera serial
 number, USB serial, LAN MAC addresses, local usernames, home paths, host names,
-filesystem UUIDs and the author's email addresses are redacted; nothing else
-was altered.
+filesystem UUIDs, API tokens and the author's email addresses are redacted;
+nothing else was altered.
 
 ## License
 
