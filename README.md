@@ -198,7 +198,7 @@ or keys are distributed here; only the procedure and the findings.
 * Legal: reverse engineering for interoperability, on hardware we own. Sony
   firmware remains Sony's property.
 
-## Session archive
+## Session archives
 
 The full working session that produced this repository — 786 transcript
 entries, every tool/background-job log untruncated, plus a standalone
@@ -206,9 +206,16 @@ entries, every tool/background-job log untruncated, plus a standalone
 
 **[session/ilce-5000-research-session.zip](session/ilce-5000-research-session.zip)**
 
-Exported with the omp `export_session_archive` plugin. Camera serial number,
-LAN MAC addresses, local usernames, home paths, host names, filesystem UUIDs
-and the author's email addresses are redacted; nothing else was altered.
+The follow-up session that made the USB capture reliable on hardware — the
+`0xd215` timing, the abort/halt cycle, the mode flips, the firmware
+`libptp.so` / `usbg_stillimage.ko` read and the retry design (693 entries):
+
+**[session/ilce-5000-usb-capture-session.zip](session/ilce-5000-usb-capture-session.zip)**
+
+Both exported with the omp `export_session_archive` plugin. Camera serial
+number, USB serial, LAN MAC addresses, local usernames, home paths, host names,
+filesystem UUIDs and the author's email addresses are redacted; nothing else
+was altered.
 
 ## License
 
